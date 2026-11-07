@@ -3,8 +3,7 @@
 What Minerva still misses compared with Notion, Logseq and AFFiNE (reviewed November 2026), and follow-ups found while building the last round. Ordered by what matters most for people switching to Minerva and for its learning focus. Move an item to `CHANGELOG.md` when it ships.
 
 ## Next
-- [ ] Users should also be able to setup their own private AI providers (only for the desktop app) so they will be able to conttrol their data and route their requests to their own models, add also as an option the use of ChaGPT abonament through OAuth.
-- [ ]
+
 
 
 

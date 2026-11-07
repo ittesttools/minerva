@@ -225,7 +225,7 @@ async fn run(
         let s = store.lock().map_err(|_| internal())?;
         ai::completion(&s, &provider_id, &PROMPT.replace("TODAY", &today), &text)?
     };
-    let answer = completion.run().await?;
+    let answer = completion.run(&store).await?;
     let summary = summary(&answer)?;
     update(id, |job| job.summary = Some(summary));
     Ok(())

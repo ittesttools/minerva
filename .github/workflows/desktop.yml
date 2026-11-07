@@ -1,0 +1,118 @@
+name: Desktop release builds
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "web/**"
+      - "plugins/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "package.json"
+      - "package-lock.json"
+      - "scripts/**"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+concurrency:
+  group: desktop-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  package:
+    name: Desktop (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-windows
+            runner: ubuntu-22.04
+          - platform: macos
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux and Windows build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev gcc-mingw-w64-x86-64 zip
+
+      - name: Install Rust and targets
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          if [ "$RUNNER_OS" = Linux ]; then
+            rustup target add x86_64-pc-windows-gnu
+          else
+            rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          fi
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.platform }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Test and build the embedded web app
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Package Linux and Windows desktop clients
+        if: runner.os == 'Linux'
+        run: scripts/package-desktop.sh linux windows
+
+      - name: Package universal macOS desktop client
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: scripts/package-desktop.sh macos
+
+      - name: Create package checksums
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          packages = sorted(Path("dist").glob("minerva-desktop-*"))
+          if not packages:
+              raise SystemExit("No desktop packages were produced")
+          lines = []
+          for package in packages:
+              with package.open("rb") as stream:
+                  hasher = hashlib.sha256()
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      hasher.update(chunk)
+                  digest = hasher.hexdigest()
+              lines.append(f"{digest}  {package.name}\n")
+          Path(f"dist/SHA256SUMS-desktop-{os.environ['PLATFORM']}.txt").write_text("".join(lines))
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: minerva-desktop-${{ matrix.platform }}
+          path: |
+            dist/minerva-desktop-*
+            dist/SHA256SUMS-desktop-*.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Download instructions
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          printf '### Desktop packages (%s)\n\nDownload **minerva-desktop-%s** from this run’s Artifacts section. Packages use the release build profile and include SHA-256 checksums. macOS packages are ad-hoc signed, not notarized.\n' "$PLATFORM" "$PLATFORM" >> "$GITHUB_STEP_SUMMARY"

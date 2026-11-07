@@ -1,6 +1,5 @@
-# Builds Minerva for Linux and Windows (the desktop app, the server and
-# minerva-cli) and publishes them as a GitHub release. macOS packages are not built here: build
-# them on a Mac with scripts/package-desktop.sh macos and package-server.sh macos.
+# Builds desktop clients for Linux, Windows and macOS, plus Linux/Windows
+# server and CLI packages, and publishes them as a GitHub release.
 #
 # Prepare a release with scripts/release.sh, which sets the version, dates the
 # changelog and tags; pushing the tag starts this workflow:
@@ -37,6 +36,10 @@ jobs:
             exit 1
           fi
 
+  desktop:
+    needs: check
+    uses: ./.github/workflows/desktop.yml
+
   linux-windows:
     needs: check
     # The oldest supported Ubuntu, so the Linux build runs on as many systems
@@ -72,9 +75,6 @@ jobs:
           npm ci
           npm run build
 
-      - name: Package the desktop app
-        run: scripts/package-desktop.sh linux windows
-
       - name: Package the server
         run: scripts/package-server.sh linux windows
 
@@ -88,7 +88,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [linux-windows]
+    needs: [desktop, linux-windows]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     permissions:
@@ -112,7 +112,7 @@ jobs:
             index($0, "## [" v "]") == 1 { on = 1; next }
             /^## \[/ { on = 0 }
             on' CHANGELOG.md >release-notes.md
-          printf '\n**Downloads:** `minerva-desktop` is the app for your computer (Linux or Windows); `minerva-server` runs your own server; `minerva-cli` searches, adds notes and makes backups from a terminal; or use the Docker image `ghcr.io/%s/minerva:%s`. Check downloads against `SHA256SUMS.txt`.\n' "${GITHUB_REPOSITORY_OWNER,,}" "$version" >>release-notes.md
+          printf '\n**Downloads:** `minerva-desktop` is the app for your computer (Linux, Windows or macOS); `minerva-server` runs your own server; `minerva-cli` searches, adds notes and makes backups from a terminal; or use the Docker image `ghcr.io/%s/minerva:%s`. Check downloads against `SHA256SUMS.txt`.\n' "${GITHUB_REPOSITORY_OWNER,,}" "$version" >>release-notes.md
 
       - name: Publish the release
         env:

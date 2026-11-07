@@ -1536,7 +1536,7 @@ async fn generate(store: Shared, headers: HeaderMap, v: Value) -> Result<Respons
         )
     };
     let _guard = GenerationGuard::acquire(&user_id)?;
-    let (text, web_sources) = request.run_with_sources().await?;
+    let (text, web_sources) = request.run_with_sources(&store).await?;
     let result: Value = serde_json::from_str(&text).map_err(|_| {
         bad("AI did not return valid card JSON. Try again or choose another model.")
     })?;

@@ -4,6 +4,8 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use futures_util::StreamExt;
+#[path = "ai_chatgpt.rs"]
+mod chatgpt;
 #[path = "ai_openrouter.rs"]
 mod openrouter;
 #[path = "ai_shell.rs"]
@@ -13,6 +15,7 @@ use std::{io::Write, path::Path, time::Duration};
 
 pub(super) struct Runtime {
     pub(super) desktop: bool,
+    oauth: chatgpt::Runtime,
     shell_pending: HashMap<String, shell::Pending>,
     shell_cancelled: HashSet<String>,
     key_path: Option<String>,
@@ -59,10 +62,29 @@ pub(super) fn initialize(
         )?;
     }
     db.execute_batch(r#"CREATE TABLE IF NOT EXISTS ai_shell_settings(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT OR IGNORE INTO ai_shell_settings VALUES(1, '{"directory":"","unattended":false}');"#)?;
+    for (column, definition) in [
+        ("private", "INTEGER NOT NULL DEFAULT 0"),
+        ("auth_mode", "TEXT NOT NULL DEFAULT 'api_key'"),
+    ] {
+        let exists: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('ai_providers') WHERE name=?1)",
+            [column],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            db.execute_batch(&format!(
+                "ALTER TABLE ai_providers ADD COLUMN {column} {definition}"
+            ))?;
+        }
+    }
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ai_oauth_host(id INTEGER PRIMARY KEY, host TEXT NOT NULL)",
+    )?;
     let mut memory_key = [0; 32];
     OsRng.fill_bytes(&mut memory_key);
     Ok(Runtime {
         desktop: false,
+        oauth: chatgpt::Runtime::default(),
         shell_pending: HashMap::new(),
         shell_cancelled: HashSet::new(),
         key_path: if path == ":memory:" {
@@ -130,6 +152,8 @@ impl Runtime {
 #[derive(Clone, Serialize, Deserialize)]
 struct Provider {
     id: String,
+    private: bool,
+    auth_mode: String,
     name: String,
     kind: String,
     endpoint: String,
@@ -204,11 +228,13 @@ struct Context {
 }
 fn provider(s: &Store, key: &str) -> Result<(Provider, Vec<u8>), ApiError> {
     s.db.query_row(
-        "SELECT id,name,kind,endpoint,model,secret,web_search,max_tokens,server_tools FROM ai_providers WHERE id=?1",
-        [key],
+        "SELECT id,name,kind,endpoint,model,secret,web_search,max_tokens,server_tools,private,auth_mode FROM ai_providers WHERE id=?1 AND (private=0 OR ?2)",
+        params![key, s.ai.desktop],
         |r| {
             Ok((
                 Provider {
+                    private: r.get(9)?,
+                    auth_mode: r.get(10)?,
                     id: r.get(0)?,
                     name: r.get(1)?,
                     kind: r.get(2)?,
@@ -239,6 +265,13 @@ fn endpoint_allowed(endpoint: &str) -> bool {
         && url.password().is_none()
         && url.query().is_none()
         && url.fragment().is_none()
+}
+fn auth_mode(s: &Store, v: &Value, kind: &str) -> Result<String, ApiError> {
+    match v["auth_mode"].as_str().unwrap_or("api_key") {
+        "api_key" => Ok("api_key".into()),
+        "none" if s.ai.desktop && kind == "compatible" => Ok("none".into()),
+        _ => Err(bad("Unsupported provider authentication")),
+    }
 }
 fn provider_kind(v: &Value) -> Result<String, ApiError> {
     let kind = field(v, "kind")?;
@@ -457,7 +490,7 @@ fn user_content(kind: &str, question: &str, files: &[Upload]) -> Result<Value, A
         ));
     }
     let text = |t: String| match kind {
-        "openai" | "openrouter" => json!({"type":"input_text","text":t}),
+        "openai" | "openrouter" | "chatgpt" => json!({"type":"input_text","text":t}),
         _ => json!({"type":"text","text":t}),
     };
     let mut parts = vec![];
@@ -468,12 +501,12 @@ fn user_content(kind: &str, question: &str, files: &[Upload]) -> Result<Value, A
                 text(format!("<document name=\"{label}\">\n{content}\n</document>"))
             }
             UploadKind::Image(media, data) => match kind {
-                "openai" | "openrouter" => json!({"type":"input_image","image_url":format!("data:{media};base64,{data}")}),
+                "openai" | "openrouter" | "chatgpt" => json!({"type":"input_image","image_url":format!("data:{media};base64,{data}")}),
                 "anthropic" => json!({"type":"image","source":{"type":"base64","media_type":media,"data":data}}),
                 _ => json!({"type":"image_url","image_url":{"url":format!("data:{media};base64,{data}")}}),
             },
             UploadKind::Pdf(data) => match kind {
-                "openai" | "openrouter" => json!({"type":"input_file","filename":label,"file_data":format!("data:application/pdf;base64,{data}")}),
+                "openai" | "openrouter" | "chatgpt" => json!({"type":"input_file","filename":label,"file_data":format!("data:application/pdf;base64,{data}")}),
                 "anthropic" => json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":data},"title":label}),
                 _ => json!({"type":"file","file":{"filename":label,"file_data":format!("data:application/pdf;base64,{data}")}}),
             },
@@ -664,6 +697,9 @@ fn route(
     parts: &[&str],
     v: Value,
 ) -> Result<Value, ApiError> {
+    if v["private"] == true && !s.ai.desktop {
+        return Err(forbidden());
+    }
     if parts.first() == Some(&"shell") {
         return shell::route(s, u, method, parts, &v);
     }
@@ -677,10 +713,10 @@ fn route(
     match (method.as_str(), parts) {
         ("GET", ["providers"]) => {
             let mut stmt =
-                s.db.prepare("SELECT id FROM ai_providers ORDER BY name")
+                s.db.prepare("SELECT id FROM ai_providers WHERE private=0 OR ?1 ORDER BY name")
                     .map_err(|_| internal())?;
             let ids = stmt
-                .query_map([], |r| r.get::<_, String>(0))
+                .query_map([s.ai.desktop], |r| r.get::<_, String>(0))
                 .map_err(|_| internal())?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| internal())?;
@@ -694,6 +730,8 @@ fn route(
             let kind = provider_kind(&v)?;
             let p = Provider {
                 id: id(),
+                private: s.ai.desktop,
+                auth_mode: auth_mode(s, &v, &kind)?,
                 name: field(&v, "name")?,
                 web_search: web_search(&v, &kind)?,
                 server_tools: server_tools(&v, &kind)?,
@@ -702,7 +740,11 @@ fn route(
                 endpoint: provider_endpoint(&v)?,
                 model: field(&v, "model")?,
             };
-            let secret = provider_secret(&v)?.ok_or_else(|| bad("An API key is required"))?;
+            let secret = if p.auth_mode == "none" {
+                ""
+            } else {
+                provider_secret(&v)?.ok_or_else(|| bad("An API key is required"))?
+            };
             let count: i64 =
                 s.db.query_row("SELECT COUNT(*) FROM ai_providers", [], |r| r.get(0))
                     .map_err(|_| internal())?;
@@ -710,7 +752,7 @@ fn route(
                 return Err(bad("Maximum 20 provider profiles"));
             }
             s.db.execute(
-                "INSERT INTO ai_providers(id, name, kind, endpoint, model, secret, web_search, max_tokens, server_tools) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                "INSERT INTO ai_providers(id, name, kind, endpoint, model, secret, web_search, max_tokens, server_tools, private, auth_mode) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![
                     p.id,
                     p.name,
@@ -720,7 +762,7 @@ fn route(
                     s.ai.encrypt(secret)?,
                     p.web_search,
                     p.max_tokens,
-                    serde_json::to_string(&p.server_tools).map_err(|_| internal())?
+                    serde_json::to_string(&p.server_tools).map_err(|_| internal())?, p.private, p.auth_mode
                 ],
             )
             .map_err(|_| internal())?;
@@ -729,8 +771,13 @@ fn route(
         ("PATCH", ["providers", key]) => {
             admin(u)?;
             let (old, _) = provider(s, key)?;
+            if old.kind == "chatgpt" {
+                return chatgpt::edit(s, &old, &v);
+            }
             let kind = provider_kind(&v)?;
             let p = Provider {
+                private: old.private,
+                auth_mode: auth_mode(s, &v, &kind)?,
                 id: old.id.clone(),
                 name: field(&v, "name")?,
                 web_search: web_search(&v, &kind)?,
@@ -740,7 +787,14 @@ fn route(
                 endpoint: provider_endpoint(&v)?,
                 model: field(&v, "model")?,
             };
-            let secret = provider_secret(&v)?;
+            let secret = if p.auth_mode == "none" {
+                Some("")
+            } else {
+                provider_secret(&v)?
+            };
+            if p.auth_mode != old.auth_mode && secret.is_none() {
+                return Err(bad("An API key is required"));
+            }
             // The stored key is never shown, so it only goes where it went before:
             // sending requests to another origin needs the key entered again.
             let origin = |e: &str| {
@@ -764,10 +818,17 @@ fn route(
                 ),
             }
             .map_err(|_| internal())?;
+            s.db.execute(
+                "UPDATE ai_providers SET auth_mode=?2 WHERE id=?1",
+                params![p.id, p.auth_mode],
+            )
+            .map_err(|_| internal())?;
             Ok(json!(p))
         }
         ("DELETE", ["providers", key]) => {
             admin(u)?;
+            provider(s, key)?;
+            chatgpt::cancel(s, key);
             s.db.execute("DELETE FROM ai_providers WHERE id=?1", [key])
                 .map_err(|_| internal())?;
             Ok(json!({"ok":true}))
@@ -929,7 +990,7 @@ async fn transform(store: &Shared, headers: &HeaderMap, v: Value) -> Result<Resp
             },
         )
     };
-    let answer = completion.run().await;
+    let answer = completion.run(store).await;
     drop(active);
     Ok(axum::Json(json!({"text": unfence(&answer?)})).into_response())
 }
@@ -962,6 +1023,11 @@ pub(super) async fn endpoint(
         .trim_start_matches("/api/v1/ai/")
         .split('/')
         .collect();
+    if parts.first() == Some(&"chatgpt") {
+        return chatgpt::endpoint(&store, &headers, &method, &parts, &v)
+            .await
+            .map(|v| axum::Json(v).into_response());
+    }
     if method == Method::POST && parts.as_slice() == ["providers", "discover"] {
         return discovery(&store, &headers, &v)
             .await
@@ -983,6 +1049,11 @@ pub(super) async fn endpoint(
         let u = authenticate(&s.data, &headers)?;
         return Ok(axum::Json(route(&mut s, &u, &method, &parts, v)?).into_response());
     }
+    {
+        let s = store.lock().map_err(|_| internal())?;
+        authenticate(&s.data, &headers)?;
+    }
+    chatgpt::fresh(&store, &field(&v, "provider_id")?).await?;
     let question = v["message"]
         .as_str()
         .filter(|s| !s.trim().is_empty() && s.len() <= 8000)
@@ -1005,7 +1076,7 @@ pub(super) async fn endpoint(
         if !endpoint_allowed(&p.endpoint) {
             return Err(bad("This provider endpoint is not a valid API base URL"));
         }
-        let secret = s.ai.decrypt(&key)?;
+        let secret = chatgpt::secret(&s, &p, &key)?;
         let context = context(&s.db, &s.data, &u, &chat.scope, Some(&question))?;
         let files = uploads(&v)?;
         let content = user_content(&p.kind, &question, &files)?;
@@ -1034,6 +1105,7 @@ pub(super) async fn endpoint(
             names,
         )
     };
+    let mut cancelled = chatgpt::cancellation(&store, &provider.id)?;
     let stream = async_stream::stream! {
         let _active=active;
         yield packet(json!({"type":"context","sources":context.sources,"truncated":context.truncated,"provider":provider.name,"model":provider.model}));
@@ -1049,10 +1121,11 @@ pub(super) async fn endpoint(
         for round in 0..=4 {
         let mut output_items=Vec::new();
         let request = model_request(&client, &provider, &secret, &system, messages.clone(), true, true);
-        let response=match request.send().await {Ok(r) if r.status().is_success()=>r,Ok(r)=>{yield packet(json!({"type":"error","message":i18n::fill("Provider returned HTTP {status}. Check the model, key, quota and endpoint.",&[("status",&r.status().as_u16().to_string())])}));return},Err(_)=>{yield packet(json!({"type":"error","message":i18n::msg("Provider connection failed or timed out.")}));return}};
+        let sent=tokio::select! { r=request.send()=>r, _=chatgpt::cancelled(&mut cancelled)=>{yield packet(json!({"type":"error","message":i18n::msg("ChatGPT request cancelled after sign-out.")}));return;} };
+        let response=match sent {Ok(r) if r.status().is_success()=>r,Ok(r)=>{yield packet(json!({"type":"error","message":i18n::fill("Provider returned HTTP {status}. Check the model, key, quota and endpoint.",&[("status",&r.status().as_u16().to_string())])}));return},Err(_)=>{yield packet(json!({"type":"error","message":i18n::msg("Provider connection failed or timed out.")}));return}};
         let mut upstream=response.bytes_stream(); let mut buffer=Vec::new();
         done=false;
-        while let Some(chunk)=upstream.next().await {
+        while let Some(chunk)=tokio::select! { c=upstream.next()=>c, _=chatgpt::cancelled(&mut cancelled)=>{failed=true;None} } {
             let chunk=match chunk {Ok(c)=>c,Err(_)=>{failed=true;break}};
             buffer.extend_from_slice(&chunk);
             if buffer.len()>12_582_912 {failed=true;break;}
@@ -1060,7 +1133,7 @@ pub(super) async fn endpoint(
                 let line:Vec<_>=buffer.drain(..=end).collect();
                 let Ok(line)=std::str::from_utf8(&line) else {failed=true;break};
                 let Some(raw)=line.trim().strip_prefix("data:").map(str::trim) else {continue};
-                if raw=="[DONE]" {done=true;break;}
+                if raw=="[DONE]" {done=provider.kind!="chatgpt";break;}
                 let value:Value=match serde_json::from_str(raw){Ok(v)=>v,Err(_)=>{failed=true;break}};
                 let event=value["type"].as_str().unwrap_or("");
                 if provider.kind == "openrouter" && provider.server_tools.iter().any(|t|t=="minerva:shell") && event == "response.output_item.done" && value["item"]["type"] != "openrouter:image_generation" {
@@ -1078,10 +1151,10 @@ pub(super) async fn endpoint(
                 }
                 // The last chunk may carry both final text and the stop: read it first.
                 let length_stop=value["choices"][0]["finish_reason"]=="length" || value["delta"]["stop_reason"]=="max_tokens" || event=="response.incomplete";
-                if ["error","response.failed"].contains(&event) || value.get("error").is_some() {failed=true;break;}
+                if (provider.kind=="chatgpt" && event=="response.incomplete") || ["error","response.failed"].contains(&event) || value.get("error").is_some() {failed=true;break;}
                 let reasoning=value["choices"][0]["delta"]["reasoning_content"].as_str().or(value["choices"][0]["delta"]["reasoning"].as_str()).or((event=="content_block_delta" && value["delta"]["type"]=="thinking_delta").then(||"…"));
                 if !thinking && reasoning.is_some_and(|r|!r.is_empty()) {thinking=true;yield packet(json!({"type":"thinking"}));}
-                let delta=match provider.kind.as_str(){"openai"|"openrouter" if event=="response.output_text.delta"=>value["delta"].as_str(),"anthropic" if event=="content_block_delta"=>value["delta"]["text"].as_str(),"deepseek"|"compatible"=>value["choices"][0]["delta"]["content"].as_str(),_=>None};
+                let delta=match provider.kind.as_str(){"openai"|"openrouter"|"chatgpt" if event=="response.output_text.delta"=>value["delta"].as_str(),"anthropic" if event=="content_block_delta"=>value["delta"]["text"].as_str(),"deepseek"|"compatible"=>value["choices"][0]["delta"]["content"].as_str(),_=>None};
                 if let Some(delta)=delta {
                     let allowed={let s=store.lock().map_err(|_|internal());s.is_ok_and(|s|authenticate(&s.data,&headers).is_ok() && context.sources.iter().all(|source|source_allowed(&s.data,&user,&chat.scope,source)) && chat_live(&s,&user,&chat).is_ok())};
                     if !allowed {failed=true;break;}
@@ -1223,6 +1296,10 @@ fn model_request(
     search: bool,
 ) -> reqwest::RequestBuilder {
     let (suffix, mut payload) = match p.kind.as_str() {
+        "chatgpt" => (
+            "responses",
+            json!({"model":p.model,"instructions":system,"input":messages,"store":false}),
+        ),
         "openai" | "openrouter" => (
             "responses",
             json!({"model":p.model,"instructions":system,"input":messages,"store":false,"max_output_tokens":p.max_tokens}),
@@ -1242,7 +1319,7 @@ fn model_request(
     // Search is opt-in for chat and researched flashcards; workers never search.
     if search && p.web_search && p.kind != "openrouter" {
         payload["tools"] = match p.kind.as_str() {
-            "openai" | "openrouter" => json!([{"type":"web_search"}]),
+            "openai" | "openrouter" | "chatgpt" => json!([{"type":"web_search"}]),
             _ => json!([{"type":"web_search_20250305","name":"web_search","max_uses":5}]),
         };
     }
@@ -1271,7 +1348,7 @@ fn model_request(
             payload["max_tool_calls"] = json!(8);
         }
     }
-    payload["stream"] = json!(stream);
+    payload["stream"] = json!(stream || p.kind == "chatgpt");
     if stream && suffix == "chat/completions" {
         payload["stream_options"] = json!({"include_usage":true});
     }
@@ -1282,6 +1359,8 @@ fn model_request(
         request
             .header("x-api-key", secret)
             .header("anthropic-version", "2023-06-01")
+    } else if p.auth_mode == "none" {
+        request
     } else {
         request.bearer_auth(secret)
     }
@@ -1290,6 +1369,7 @@ fn model_request(
 /// Credential-bearing requests stay in the host; plugins only supply bounded text.
 pub(super) struct Completion {
     request: reqwest::RequestBuilder,
+    provider_id: String,
     kind: String,
 }
 pub(super) fn completion(
@@ -1299,7 +1379,7 @@ pub(super) fn completion(
     input: &str,
 ) -> Result<Completion, ApiError> {
     let (p, encrypted) = provider(s, provider_id)?;
-    let secret = s.ai.decrypt(&encrypted)?;
+    let secret = chatgpt::secret(s, &p, &encrypted)?;
     let request = model_request(
         &s.ai.client,
         &p,
@@ -1310,6 +1390,7 @@ pub(super) fn completion(
         false,
     );
     Ok(Completion {
+        provider_id: p.id.clone(),
         request,
         kind: p.kind,
     })
@@ -1329,8 +1410,9 @@ pub(super) fn flashcard_completion(
             "Topic research requires an OpenAI or Anthropic profile with web search enabled.",
         ));
     }
-    let secret = s.ai.decrypt(&encrypted)?;
+    let secret = chatgpt::secret(s, &p, &encrypted)?;
     Ok(Completion {
+        provider_id: p.id.clone(),
         request: model_request(
             &s.ai.client,
             &p,
@@ -1344,20 +1426,43 @@ pub(super) fn flashcard_completion(
     })
 }
 impl Completion {
-    pub(super) async fn run(self) -> Result<String, ApiError> {
-        self.run_with_sources().await.map(|(text, _)| text)
+    pub(super) async fn run(self, store: &Shared) -> Result<String, ApiError> {
+        self.run_with_sources(store).await.map(|(text, _)| text)
     }
-    pub(super) async fn run_with_sources(self) -> Result<(String, Vec<String>), ApiError> {
-        let response = self
-            .request
-            .send()
-            .await
-            .map_err(|_| bad("Provider connection failed or timed out"))?;
+    pub(super) async fn run_with_sources(
+        mut self,
+        store: &Shared,
+    ) -> Result<(String, Vec<String>), ApiError> {
+        let mut cancelled = chatgpt::cancellation(store, &self.provider_id)?;
+        if self.kind == "chatgpt" {
+            chatgpt::fresh(store, &self.provider_id).await?;
+            let s = store.lock().map_err(|_| internal())?;
+            let (p, key) = provider(&s, &self.provider_id)?;
+            let mut headers = reqwest::header::HeaderMap::new();
+            let mut value = reqwest::header::HeaderValue::from_str(&format!(
+                "Bearer {}",
+                chatgpt::secret(&s, &p, &key)?
+            ))
+            .map_err(|_| internal())?;
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            self.request = self.request.headers(headers);
+        }
+        let response = tokio::select! {
+            r = self.request.send() => r.map_err(|_| bad("Provider connection failed or timed out"))?,
+            _ = chatgpt::cancelled(&mut cancelled) => return Err(bad("ChatGPT request cancelled after sign-out.")),
+        };
         if !response.status().is_success() {
             return Err(badv(
                 "Provider returned HTTP {status}. Check its key, model and quota.",
                 &[("status", &response.status().as_u16().to_string())],
             ));
+        }
+        if self.kind == "chatgpt" {
+            return tokio::select! {
+                result = chatgpt::completion_response(response) => result,
+                _ = chatgpt::cancelled(&mut cancelled) => Err(bad("ChatGPT request cancelled after sign-out.")),
+            };
         }
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();

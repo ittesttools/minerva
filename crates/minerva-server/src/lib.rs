@@ -257,6 +257,7 @@ impl Store {
                 return Err(format!("{path} belongs to a server, not a desktop app").into());
             }
             s.ai.desktop = true;
+            s.db.execute("UPDATE ai_providers SET private=1", [])?;
             let mut d = s.data.clone();
             let user_id = d.users[0].user.id.clone();
             d.sessions.clear();

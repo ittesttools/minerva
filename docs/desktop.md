@@ -22,6 +22,12 @@ The Linux archive contains the binary, a `.desktop` entry, a 256 px icon, and `i
 
 The desktop crate is not one of the workspace's default members, so `cargo build` and `cargo run -p minerva-server` work without GUI libraries. `cargo test --workspace` includes it.
 
+## GitHub builds and releases
+
+[Desktop release builds](https://github.com/akaped/minerva/actions/workflows/desktop.yml) builds Linux x86_64, Windows x86_64, and universal macOS packages. It runs when desktop dependencies or sources change on `main`, and can also be started from **Actions → Desktop release builds → Run workflow** on a chosen branch. Download the `minerva-desktop-linux-windows` and `minerva-desktop-macos` artifacts from the completed run; both include SHA-256 checksums. Artifacts are retained for 30 days. macOS builds are ad-hoc signed and are not notarized.
+
+The existing **Release** workflow reuses these desktop builds and attaches the packages to the GitHub release when a version tag is pushed. Prepare the version and changelog with `scripts/release.sh VERSION`, then push the branch and generated `vVERSION` tag. The tag must match `Cargo.toml`. A manual desktop build produces downloadable artifacts without creating a version tag or publishing a GitHub release.
+
 ## Using it
 
 The app opens the server you had open last, or **This computer** (personal notes and offline copies) the first time, or when that server is signed out or does not answer within 3 seconds. Nothing needs to be configured. The launcher (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>O</kbd>) lists servers. **Add a server** with its address: HTTPS is assumed, and `localhost`/`127.x` may use HTTP. The client calls `/api/v1/health`, requires API version 1, and records the server's persistent UUID. **Open** loads the server's normal web interface; sign in there as usual. Use **Minerva → Servers…** or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>O</kbd> (<kbd>⌘</kbd>+<kbd>Shift</kbd>+<kbd>O</kbd> on macOS) to return to the launcher. The launcher also offers **Offline…** (choose workspaces to keep on this computer; sign in first), **Sign out** (revokes the session on the server, and pauses syncing), **Rename**, and **Remove**.
@@ -62,3 +68,21 @@ The web interface itself is unchanged, except that the gateway adds `<meta name=
 - Share links (`/share#…`) and the publishing **Preview** need browser cookies, which the gateway does not keep. Links to published pages and absolute share URLs open in the system browser.
 - Offline copies sync about every two seconds and do not relay presence. For live co-editing with presence, use **Open** on the server. Sharing, publishing, and administration are online-only. See [sync.md](sync.md#limits).
 - No notifications, auto-update, or installer (MSI or Flatpak) yet.
+
+## Private AI providers
+
+Open the **personal workspace**, then **AI providers**. Profiles created here are private to this computer. Credentials are encrypted in the desktop database with its adjacent `.ai-key` file; back up both together. Provider profiles and credentials are not included in workspace replication. Opening that database through the network server does not enable its private profiles.
+
+Choose an API provider and enter your own key, or choose **OpenAI-compatible API** for a self-hosted model. For example, an Ollama installation with its compatible API enabled can use `http://127.0.0.1:11434/v1`, an installed model ID, and **No authentication (self-hosted)**. Use **API key** when your model server requires one. Requests go directly from the desktop to the selected endpoint. A local model can keep inference on this computer; a cloud endpoint receives the selected context and attachments.
+
+Private profiles work with the personal workspace and local offline copies, including chat, writing assistance, and non-research generation. Connected remote server pages continue to use the remote server's configured providers. To use a private model with server content, open its offline copy from the personal workspace. Local copies retain their existing replication limitations.
+
+### ChatGPT subscription sign-in
+
+Choose **ChatGPT**, give the profile a name, and select **Continue with ChatGPT**. Follow **Open ChatGPT sign-in in your browser**, approve access, and return to Minerva. Minerva loads the account's available models and initially selects the first listed model. Use **Edit → Load available models** to choose another model and save it.
+
+This uses OpenAI's [native open-source token-sharing flow](https://developers.openai.com/siwc/token-sharing-open-source/sign-in), with PKCE and a temporary loopback callback on `127.0.0.1`. Eligibility, available models and subscription usage limits are controlled by OpenAI. Subscription access is separate from API billing; Minerva never falls back to a paid API key when it runs out. No Codex installation or copied browser credentials are required.
+
+Tokens stay encrypted locally, refresh automatically, and are never returned to the webview. **Sign out of ChatGPT** clears local tokens and attempts remote revocation. If remote revocation cannot be confirmed, revoke Minerva's access in ChatGPT settings. The local account registration is retained so **Edit → Continue with ChatGPT** can reconnect the same account. Removing the profile forgets that registration.
+
+ChatGPT uses the public Responses endpoint with `store: false` and streaming enabled, including background writing requests. Partial or failed responses are rejected. Its [preview API limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations) mean this profile currently has no configurable answer-token limit, native tools, researched flashcards, or audio transcription. Other provider profiles retain those features where supported.

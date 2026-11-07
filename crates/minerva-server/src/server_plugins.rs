@@ -755,7 +755,7 @@ async fn execute(
                 input,
             )?
         };
-        let answer = completion.run().await?;
+        let answer = completion.run(&store).await?;
         let result = worker(
             p,
             json!({"operation":"validate","answer":answer,"sources":batch}),

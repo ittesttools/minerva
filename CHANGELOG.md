@@ -12,6 +12,10 @@ turns that section into the next version.
 
 ### Added
 
+- **Desktop release builds:** GitHub Actions packages Linux, Windows and universal macOS clients on relevant main-branch pushes or manual runs; versioned releases reuse the same builds.
+
+- **Private desktop AI:** personal API-key and unauthenticated self-hosted profiles, isolated from server providers and workspace sync. ChatGPT subscription OAuth uses a system-browser sign-in, encrypted local tokens, automatic refresh, model discovery and sign-out. Available in the personal workspace and offline copies; remote server pages retain their own providers.
+
 - **OpenRouter:** discover available models and tools during provider setup, configure server tools per profile, and display generated images in chat. Desktop Shell asks before each command by default, with an optional unattended setting and working folder. Hosted Shell is labeled separately.
 
 - **Workspace-limited API tokens:** choose a workspace when creating a personal token. Note and folder permissions, direct shares, search, databases, exports and attachments stay inside that workspace and follow later permission changes. Account-wide features and unaudited routes are denied for scoped tokens; existing unscoped tokens keep working.
